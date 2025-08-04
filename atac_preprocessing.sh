@@ -2,132 +2,134 @@
 
 # atac_preprocessing.sh
 # Author: Abdelaziz Awad
-# Description: Full ATAC-seq preprocessing workflow
-# Usage: bash atac_preprocessing.sh
+# Description: General bulk ATAC-seq preprocessing pipeline
+# Usage: bash atac_preprocessing.sh <TREAT_SRA_ID> <CTRL_SRA_ID> <TREAT_NAME> <CTRL_NAME> [THREADS]
 
 set -euo pipefail
 
 # -----------------------------
-# CONFIGURATION
+# INPUTS & CONFIGURATION
 # -----------------------------
-# Assign thread count using command line argument if available, otherwise default to 12
-THREADS="${1:-12}"
-GENOME_INDEX="mm10"  # Bowtie2 index prefix (already built)
+TREAT_SRA="$1"         # e.g. SRR12345678
+CTRL_SRA="$2"          # e.g. SRR87654321
+TREAT_NAME="$3"        # e.g. KO
+CTRL_NAME="$4"         # e.g. WT
+THREADS="${5:-12}"     # default to 12 threads
+
+GENOME_INDEX="mm10"    # Bowtie2 prefix
+HOMER_GENOME="mm10"    # HOMER genome
 CHROM_SIZES="mm10.chrom.sizes"
-PEAK_NAME="KO_vs_WT"
-HOMER_GENOME="mm10"
+PEAK_NAME="${TREAT_NAME}_vs_${CTRL_NAME}"
 OUTDIR="atac_output"
 
-# Create necessary directories
-echo "📁 Creating output directories..."
+# Make folders
 mkdir -p "$OUTDIR" "$OUTDIR/macs3_output" "$OUTDIR/homer_output" "$OUTDIR/motif_locations_output"
 
 # -----------------------------
-# 1. DOWNLOAD & CONVERT SRA
+# 1. DOWNLOAD & FASTQ CONVERT
 # -----------------------------
-echo "📥 Downloading and converting SRA files..."
-prefetch SRR13827703 SRR13827711
-fasterq-dump SRR13827703 SRR13827711 --split-files --threads "$THREADS"
-gzip *.fastq
+echo "📥 Downloading and converting..."
+prefetch "$TREAT_SRA" "$CTRL_SRA"
+fasterq-dump "$TREAT_SRA" "$CTRL_SRA" --split-files --threads "$THREADS"
+gzip "${TREAT_SRA}"*.fastq "${CTRL_SRA}"*.fastq
 
 # -----------------------------
-# 2. QC + TRIMMING (fastp)
+# 2. QC & TRIMMING (fastp)
 # -----------------------------
-echo "🧹 Running fastp QC and trimming..."
-fastp -i SRR13827703_1.fastq.gz -I SRR13827703_2.fastq.gz \
-      -o "$OUTDIR/WT_R1.trimmed.fastq.gz" -O "$OUTDIR/WT_R2.trimmed.fastq.gz" \
-      --html "$OUTDIR/WT_fastp.html" --thread "$THREADS"
-fastp -i SRR13827711_1.fastq.gz -I SRR13827711_2.fastq.gz \
-      -o "$OUTDIR/KO_R1.trimmed.fastq.gz" -O "$OUTDIR/KO_R2.trimmed.fastq.gz" \
-      --html "$OUTDIR/KO_fastp.html" --thread "$THREADS"
+echo "🧹 Trimming adapters with fastp..."
+fastp -i "${TREAT_SRA}_1.fastq.gz" -I "${TREAT_SRA}_2.fastq.gz" \
+      -o "$OUTDIR/${TREAT_NAME}_R1.trimmed.fastq.gz" -O "$OUTDIR/${TREAT_NAME}_R2.trimmed.fastq.gz" \
+      --html "$OUTDIR/${TREAT_NAME}_fastp.html" --thread "$THREADS"
+
+fastp -i "${CTRL_SRA}_1.fastq.gz" -I "${CTRL_SRA}_2.fastq.gz" \
+      -o "$OUTDIR/${CTRL_NAME}_R1.trimmed.fastq.gz" -O "$OUTDIR/${CTRL_NAME}_R2.trimmed.fastq.gz" \
+      --html "$OUTDIR/${CTRL_NAME}_fastp.html" --thread "$THREADS"
 
 # -----------------------------
 # 3. ALIGNMENT (Bowtie2)
 # -----------------------------
-echo "🧬 Aligning reads with Bowtie2..."
-bowtie2 -x "$GENOME_INDEX" -1 "$OUTDIR/WT_R1.trimmed.fastq.gz" -2 "$OUTDIR/WT_R2.trimmed.fastq.gz" -S "$OUTDIR/WT.sam" -p "$THREADS"
-bowtie2 -x "$GENOME_INDEX" -1 "$OUTDIR/KO_R1.trimmed.fastq.gz" -2 "$OUTDIR/KO_R2.trimmed.fastq.gz" -S "$OUTDIR/KO.sam" -p "$THREADS"
+echo "🧬 Aligning to genome..."
+bowtie2 -x "$GENOME_INDEX" -1 "$OUTDIR/${TREAT_NAME}_R1.trimmed.fastq.gz" -2 "$OUTDIR/${TREAT_NAME}_R2.trimmed.fastq.gz" -S "$OUTDIR/${TREAT_NAME}.sam" -p "$THREADS"
+bowtie2 -x "$GENOME_INDEX" -1 "$OUTDIR/${CTRL_NAME}_R1.trimmed.fastq.gz" -2 "$OUTDIR/${CTRL_NAME}_R2.trimmed.fastq.gz" -S "$OUTDIR/${CTRL_NAME}.sam" -p "$THREADS"
 
 # -----------------------------
 # 4. SORT & INDEX BAM
 # -----------------------------
-echo "📦 Converting, sorting, and indexing BAM files..."
-samtools view -bS "$OUTDIR/WT.sam" | samtools sort -o "$OUTDIR/WT.sorted.bam" --threads "$THREADS"
-samtools view -bS "$OUTDIR/KO.sam" | samtools sort -o "$OUTDIR/KO.sorted.bam" --threads "$THREADS"
-samtools index "$OUTDIR/WT.sorted.bam"
-samtools index "$OUTDIR/KO.sorted.bam"
-rm "$OUTDIR/WT.sam" "$OUTDIR/KO.sam" # Clean up intermediate SAM files
+echo "📦 Sorting and indexing BAMs..."
+for SAMPLE in "$TREAT_NAME" "$CTRL_NAME"; do
+    samtools view -bS "$OUTDIR/$SAMPLE.sam" | samtools sort -@ "$THREADS" -o "$OUTDIR/$SAMPLE.sorted.bam"
+    samtools index "$OUTDIR/$SAMPLE.sorted.bam"
+    rm "$OUTDIR/$SAMPLE.sam"
+done
 
 # -----------------------------
-# 5. FILTER BAM FILES
+# 5. FILTER chrM + low quality
 # -----------------------------
-echo "🧯 Filtering for unmapped reads, chrM, and proper pairs..."
-samtools view -F 4 -f 2 -q 20 -@ "$THREADS" "$OUTDIR/WT.sorted.bam" | grep -v 'chrM' | samtools view -b > "$OUTDIR/WT.filtered.bam"
-samtools view -F 4 -f 2 -q 20 -@ "$THREADS" "$OUTDIR/KO.sorted.bam" | grep -v 'chrM' | samtools view -b > "$OUTDIR/KO.filtered.bam"
-samtools index "$OUTDIR/WT.filtered.bam"
-samtools index "$OUTDIR/KO.filtered.bam"
-rm "$OUTDIR/WT.sorted.bam" "$OUTDIR/KO.sorted.bam" # Clean up intermediate sorted BAMs
+echo "🧯 Filtering BAMs..."
+for SAMPLE in "$TREAT_NAME" "$CTRL_NAME"; do
+    samtools view -F 4 -f 2 -q 20 -@ "$THREADS" "$OUTDIR/$SAMPLE.sorted.bam" | grep -v 'chrM' | samtools view -b > "$OUTDIR/$SAMPLE.filtered.bam"
+    samtools index "$OUTDIR/$SAMPLE.filtered.bam"
+    rm "$OUTDIR/$SAMPLE.sorted.bam"
+done
 
 # -----------------------------
-# 6. REMOVE DUPLICATES (Picard)
+# 6. REMOVE DUPLICATES
 # -----------------------------
 echo "🧽 Removing duplicates with Picard..."
-picard MarkDuplicates I="$OUTDIR/WT.filtered.bam" O="$OUTDIR/WT.cleaned.bam" M="$OUTDIR/WT.metrics.txt" REMOVE_DUPLICATES=true
-picard MarkDuplicates I="$OUTDIR/KO.filtered.bam" O="$OUTDIR/KO.cleaned.bam" M="$OUTDIR/KO.metrics.txt" REMOVE_DUPLICATES=true
-samtools index "$OUTDIR/WT.cleaned.bam"
-samtools index "$OUTDIR/KO.cleaned.bam"
-rm "$OUTDIR/WT.filtered.bam" "$OUTDIR/KO.filtered.bam" # Clean up intermediate filtered BAMs
+for SAMPLE in "$TREAT_NAME" "$CTRL_NAME"; do
+    picard MarkDuplicates I="$OUTDIR/$SAMPLE.filtered.bam" O="$OUTDIR/$SAMPLE.cleaned.bam" M="$OUTDIR/$SAMPLE.metrics.txt" REMOVE_DUPLICATES=true
+    samtools index "$OUTDIR/$SAMPLE.cleaned.bam"
+    rm "$OUTDIR/$SAMPLE.filtered.bam"
+done
 
 # -----------------------------
 # 7. PEAK CALLING (MACS3)
 # -----------------------------
-echo "🚩 Calling peaks with MACS3..."
+echo "🚩 Peak calling with MACS3..."
 macs3 callpeak \
-  -t "$OUTDIR/KO.cleaned.bam" \
-  -c "$OUTDIR/WT.cleaned.bam" \
-  -f BAMPE -g mm \
-  -n "$PEAK_NAME" \
-  --outdir "$OUTDIR/macs3_output" \
-  --nomodel --shift -100 --extsize 200 \
-  -B --SPMR --keep-dup all
+  -t "$OUTDIR/${TREAT_NAME}.cleaned.bam" \
+  -c "$OUTDIR/${CTRL_NAME}.cleaned.bam" \
+  -f BAMPE -g mm -n "$PEAK_NAME" \
+  --outdir "$OUTDIR/macs3_output" \
+  --nomodel --shift -100 --extsize 200 \
+  -B --SPMR --keep-dup all
 
 # -----------------------------
 # 8. COVERAGE TRACKS (BigWig)
 # -----------------------------
-echo "📊 Creating BigWig tracks..."
-curl -s -o "$OUTDIR/$CHROM_SIZES" https://hgdownload.soe.ucsc.edu/goldenPath/mm10/bigZips/mm10.chrom.sizes
-sort -k1,1 -k2,2n "$OUTDIR/macs3_output/${PEAK_NAME}_treat_pileup.bdg" > "$OUTDIR/macs3_output/KO_treat.sorted.bdg"
-bedGraphToBigWig "$OUTDIR/macs3_output/KO_treat.sorted.bdg" "$OUTDIR/$CHROM_SIZES" "$OUTDIR/macs3_output/KO_treat.bw"
-# Remove intermediate bedGraph file to save space
-rm "$OUTDIR/macs3_output/KO_treat.sorted.bdg"
+echo "📊 Generating BigWig tracks..."
+curl -s -o "$OUTDIR/$CHROM_SIZES" "https://hgdownload.soe.ucsc.edu/goldenPath/mm10/bigZips/mm10.chrom.sizes"
+# Create BigWig for treatment sample
+sort -k1,1 -k2,2n "$OUTDIR/macs3_output/${PEAK_NAME}_treat_pileup.bdg" > "$OUTDIR/macs3_output/${TREAT_NAME}_treat.sorted.bdg"
+bedGraphToBigWig "$OUTDIR/macs3_output/${TREAT_NAME}_treat.sorted.bdg" "$OUTDIR/$CHROM_SIZES" "$OUTDIR/macs3_output/${TREAT_NAME}_treat.bw"
+rm "$OUTDIR/macs3_output/${TREAT_NAME}_treat.sorted.bdg"
+# Create BigWig for control sample
+sort -k1,1 -k2,2n "$OUTDIR/macs3_output/${PEAK_NAME}_control_lambda.bdg" > "$OUTDIR/macs3_output/${CTRL_NAME}_control.sorted.bdg"
+bedGraphToBigWig "$OUTDIR/macs3_output/${CTRL_NAME}_control.sorted.bdg" "$OUTDIR/$CHROM_SIZES" "$OUTDIR/macs3_output/${CTRL_NAME}_control.bw"
+rm "$OUTDIR/macs3_output/${CTRL_NAME}_control.sorted.bdg"
 
 # -----------------------------
-# 9. MOTIF ANALYSIS (HOMER)
+# 9. MOTIF DISCOVERY (HOMER)
 # -----------------------------
-echo "🔎 Running HOMER motif analysis..."
-findMotifsGenome.pl "$OUTDIR/macs3_output/${PEAK_NAME}_peaks.narrowPeak" "$HOMER_GENOME" "$OUTDIR/homer_output/" -size given
+echo "🔎 Motif discovery..."
+findMotifsGenome.pl "$OUTDIR/macs3_output/${PEAK_NAME}_peaks.narrowPeak" "$HOMER_GENOME" "$OUTDIR/homer_output" -size given
 annotatePeaks.pl "$OUTDIR/macs3_output/${PEAK_NAME}_peaks.narrowPeak" "$HOMER_GENOME" > "$OUTDIR/annotated_peaks.txt"
 
-# Extra motif mapping
-findMotifsGenome.pl "$OUTDIR/macs3_output/${PEAK_NAME}_peaks.narrowPeak" "$HOMER_GENOME" "$OUTDIR/motif_locations_output/" -find "$OUTDIR/homer_output/homerMotifs.all.motifs" > "$OUTDIR/motif_locations.txt"
+# Optional motif mapping
+findMotifsGenome.pl "$OUTDIR/macs3_output/${PEAK_NAME}_peaks.narrowPeak" "$HOMER_GENOME" "$OUTDIR/motif_locations_output" -find "$OUTDIR/homer_output/homerMotifs.all.motifs" > "$OUTDIR/motif_locations.txt"
 
 # -----------------------------
-# 10. MERGE MOTIF LOCATIONS WITH PEAKS
+# 10. MERGE MOTIFS + PEAKS
 # -----------------------------
-echo "📎 Merging motif info with peaks..."
-# Use a more robust and streamlined joining method
+echo "📎 Merging motifs with peaks..."
+# Use a proper header and join in one step
+(echo -e "PeakID\tOffset\tSequence\tMotifName\tStrand\tMotifScore\tchr\tstart\tend\tname\tscore\tstrand\tsignal\tpval\tqval\tsummit"
 join -t $'\t' \
-    <(tail -n +2 "$OUTDIR/motif_locations.txt" | sort -k1,1) \
-    <(awk 'BEGIN {OFS="\t"} {print $4, $0}' "$OUTDIR/macs3_output/${PEAK_NAME}_peaks.narrowPeak" | sort -k1,1) \
-    > "$OUTDIR/merged_motifs_and_peaks.tsv"
-
-# Create a proper header and prepend it
-(echo -e "PeakID\tOffset\tSequence\tMotifName\tStrand\tMotifScore\tchr\tstart\tend\tname\tscore\tstrand\tsignal\tpval\tqval\tsummit" && cat "$OUTDIR/merged_motifs_and_peaks.tsv") > "$OUTDIR/final_merged_motifs.tsv"
-
-# Clean up intermediate files
-rm "$OUTDIR/merged_motifs_and_peaks.tsv"
+    <(tail -n +2 "$OUTDIR/motif_locations.txt" | sort -k1,1) \
+    <(awk 'BEGIN{OFS="\t"}{print $4,$0}' "$OUTDIR/macs3_output/${PEAK_NAME}_peaks.narrowPeak" | sort -k1,1)) \
+    > "$OUTDIR/final_merged_motifs.tsv"
 
 # -----------------------------
 # DONE
 # -----------------------------
-echo "✅ ATAC-seq preprocessing complete. All outputs are in the '$OUTDIR' directory."
+echo "✅ General ATAC-seq pipeline complete. All results saved to $OUTDIR"
