@@ -1,4 +1,4 @@
-
+# pipelines for Bulk ATAC-seq preprocessing 
 # Download Picard JAR
 mkdir -p ~/tools/picard
 cd ~/tools/picard
